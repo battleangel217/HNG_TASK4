@@ -6,7 +6,10 @@ from PIL import Image, ImageDraw, ImageFont
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.decorators import api_view
 from django.shortcuts import get_object_or_404
+from django.db import transaction
+from django.utils import timezone
 from django.conf import settings
 from django.http import FileResponse, HttpResponse
 from .models import Country
@@ -41,69 +44,124 @@ class CountryViewSet(viewsets.ModelViewSet):
     def get_object(self):
         return get_object_or_404(Country, name__iexact=self.kwargs['name'])
 
+    def list(self, request, *args, **kwargs):
+        """Return a plain list (not paginated) of countries to match required API contract."""
+        queryset = self.get_queryset()
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+    def retrieve(self, request, name=None):
+        country = Country.objects.filter(name__iexact=name).first()
+        if not country:
+            return Response({"error": "Country not found"}, status=status.HTTP_404_NOT_FOUND)
+        serializer = self.get_serializer(country)
+        return Response(serializer.data)
+
+    def destroy(self, request, name=None):
+        country = Country.objects.filter(name__iexact=name).first()
+        if not country:
+            return Response({"error": "Country not found"}, status=status.HTTP_404_NOT_FOUND)
+        country.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
     @action(detail=False, methods=['post'])
     def refresh(self, request):
+        # Fetch external data first. If either external API fails, do not modify DB.
         try:
-            # Fetch countries data
-            countries_response = requests.get(
+            countries_resp = requests.get(
                 'https://restcountries.com/v2/all?fields=name,capital,region,population,flag,currencies',
-                timeout=10
+                timeout=15,
             )
-            countries_data = countries_response.json()
+            countries_resp.raise_for_status()
+            countries_data = countries_resp.json()
+        except requests.exceptions.RequestException:
+            return Response({"error": "External data source unavailable", "details": "Could not fetch data from countries API"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-            # Fetch exchange rates
-            exchange_response = requests.get('https://open.er-api.com/v6/latest/USD', timeout=10)
-            exchange_data = exchange_response.json()
-            rates = exchange_data.get('rates', {})
+        try:
+            exchange_resp = requests.get('https://open.er-api.com/v6/latest/USD', timeout=15)
+            exchange_resp.raise_for_status()
+            exchange_json = exchange_resp.json()
+            rates = exchange_json.get('rates')
+            if rates is None:
+                raise ValueError('rates missing')
+        except (requests.exceptions.RequestException, ValueError):
+            return Response({"error": "External data source unavailable", "details": "Could not fetch data from exchange rates API"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-            # Process each country
-            for country_data in countries_data:
-                # Extract currency code if available
-                currencies = country_data.get('currencies', [])
-                currency_code = currencies[0].get('code') if currencies else None
+        # Both external APIs are OK — proceed to update DB inside a transaction
+        try:
+            with transaction.atomic():
+                for country_data in countries_data:
+                    name = country_data.get('name')
+                    if not name:
+                        continue
 
-                # Calculate exchange rate and GDP
-                exchange_rate = None
-                estimated_gdp = None
-                if currency_code and currency_code in rates:
-                    exchange_rate = rates[currency_code]
-                    population = country_data.get('population', 0)
-                    if population and exchange_rate:
-                        multiplier = random.uniform(1000, 2000)
-                        estimated_gdp = (population * multiplier) / exchange_rate
+                    currencies = country_data.get('currencies') or []
+                    currency_code = None
+                    if len(currencies) > 0 and currencies[0]:
+                        currency_code = currencies[0].get('code') if isinstance(currencies[0], dict) else None
 
-                # Update or create country record
-                country, _ = Country.objects.update_or_create(
-                    name=country_data['name'],
-                    defaults={
-                        'capital': country_data.get('capital'),
-                        'region': country_data.get('region'),
-                        'population': country_data.get('population', 0),
-                        'currency_code': currency_code,
-                        'exchange_rate': exchange_rate,
-                        'estimated_gdp': estimated_gdp,
-                        'flag_url': country_data.get('flag'),
-                    }
-                )
+                    exchange_rate = None
+                    estimated_gdp = None
+
+                    population = country_data.get('population') or 0
+
+                    if not currencies:
+                        # Spec: if currencies array is empty, set currency_code null, exchange_rate null, estimated_gdp 0
+                        currency_code = None
+                        exchange_rate = None
+                        estimated_gdp = 0
+                    else:
+                        if currency_code and currency_code in rates:
+                            try:
+                                exchange_rate = float(rates[currency_code])
+                            except Exception:
+                                exchange_rate = None
+
+                            if population and exchange_rate:
+                                multiplier = random.uniform(1000, 2000)
+                                estimated_gdp = (population * multiplier) / exchange_rate
+                        else:
+                            # currency present but not found in rates
+                            exchange_rate = None
+                            estimated_gdp = None
+
+                    # Match existing by name case-insensitive
+                    existing = Country.objects.filter(name__iexact=name).first()
+                    if existing:
+                        existing.capital = country_data.get('capital')
+                        existing.region = country_data.get('region')
+                        existing.population = population
+                        existing.currency_code = currency_code
+                        existing.exchange_rate = exchange_rate
+                        existing.estimated_gdp = estimated_gdp
+                        existing.flag_url = country_data.get('flag')
+                        # auto_now will update last_refreshed_at on save
+                        existing.save()
+                    else:
+                        Country.objects.create(
+                            name=name,
+                            capital=country_data.get('capital'),
+                            region=country_data.get('region'),
+                            population=population,
+                            currency_code=currency_code,
+                            exchange_rate=exchange_rate,
+                            estimated_gdp=estimated_gdp,
+                            flag_url=country_data.get('flag')
+                        )
 
             # Generate summary image
             self.generate_summary_image()
 
+            last_ref = Country.objects.order_by('-last_refreshed_at').first()
+            last_refreshed_at = last_ref.last_refreshed_at if last_ref else None
+
             return Response({
                 'message': 'Countries data refreshed successfully',
-                'total_countries': Country.objects.count()
+                'total_countries': Country.objects.count(),
+                'last_refreshed_at': last_refreshed_at,
             })
-
-        except requests.exceptions.RequestException as e:
-            return Response({
-                'error': 'External data source unavailable',
-                'details': str(e)
-            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         except Exception as e:
-            return Response({
-                'error': 'Internal server error',
-                'details': str(e)
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({'error': 'Internal server error', 'details': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['get'])
     def status(self, request):
@@ -172,3 +230,15 @@ class CountryViewSet(viewsets.ModelViewSet):
 
         # Save image
         image.save(os.path.join(cache_dir, 'summary.png'))
+
+
+@api_view(['GET'])
+def status_view(request):
+    """Top-level status endpoint expected at /status"""
+    total_countries = Country.objects.count()
+    last_refreshed = Country.objects.order_by('-last_refreshed_at').first()
+    last_refreshed_at = last_refreshed.last_refreshed_at if last_refreshed else None
+    return Response({
+        'total_countries': total_countries,
+        'last_refreshed_at': last_refreshed_at
+    })
