@@ -137,3 +137,7 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# Avoid automatic slash-redirects for POST requests (prevents RuntimeError on Railway when
+# client posts to URL without trailing slash). Clients should still prefer trailing slashes.
+APPEND_SLASH = False

@@ -64,6 +64,43 @@ class CountryViewSet(viewsets.ModelViewSet):
         country.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
+    def _validate_required_fields(self, data, partial=False):
+        errors = {}
+        # For create (partial=False) require these fields
+        if not partial:
+            if not data.get('name'):
+                errors['name'] = 'is required'
+            # population may be provided as str; check presence
+            if 'population' not in data or data.get('population') in [None, '']:
+                errors['population'] = 'is required'
+            if not data.get('currency_code'):
+                errors['currency_code'] = 'is required'
+        return errors
+
+    def create(self, request, *args, **kwargs):
+        errors = self._validate_required_fields(request.data, partial=False)
+        if errors:
+            return Response({"error": "Validation failed", "details": errors}, status=status.HTTP_400_BAD_REQUEST)
+        serializer = self.get_serializer(data=request.data)
+        if not serializer.is_valid():
+            return Response({"error": "Validation failed", "details": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
+        self.perform_create(serializer)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    def update(self, request, name=None, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        instance = Country.objects.filter(name__iexact=name).first()
+        if not instance:
+            return Response({"error": "Country not found"}, status=status.HTTP_404_NOT_FOUND)
+        errors = self._validate_required_fields(request.data, partial=partial)
+        if errors:
+            return Response({"error": "Validation failed", "details": errors}, status=status.HTTP_400_BAD_REQUEST)
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        if not serializer.is_valid():
+            return Response({"error": "Validation failed", "details": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
+        serializer.save()
+        return Response(serializer.data)
+
     @action(detail=False, methods=['post'])
     def refresh(self, request):
         # Fetch external data first. If either external API fails, do not modify DB.
